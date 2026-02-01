@@ -1,0 +1,378 @@
+@page "/import"
+@rendermode InteractiveServer
+@using System.Net.Http.Json
+@using System.Text.Json.Serialization
+@using Microsoft.EntityFrameworkCore
+@using CardVault.Data
+@using CardVault.Models
+@inject ApplicationDbContext Db
+@inject HttpClient Http
+
+<h3>Import</h3>
+
+<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+
+    <!-- SETS -->
+    <div style="min-width:360px; max-width:520px; padding:14px; border:1px solid rgba(255,255,255,.12); border-radius:10px;">
+        <h4 style="margin-top:0;">1) Sets importieren</h4>
+
+        <button type="button" @onclick="ImportSetsAsync"
+                disabled="@isBusySets"
+                style="padding:8px 12px; border-radius:8px; border:1px solid rgba(255,255,255,.18);">
+            @(isBusySets ? "Import läuft…" : "Sets importieren (YGOPRODeck)")
+        </button>
+
+        <div style="margin-top:10px; opacity:.9;">
+            @setsStatus
+        </div>
+
+        <div style="margin-top:10px; font-size:.9rem; opacity:.75;">
+            Importiert Set-Code + Set-Name in <code>CardSets</code>. (Nichts wird gemischt – jedes Set bleibt separat und erscheint im Dropdown.)
+        </div>
+    </div>
+
+    <!-- CARDS FOR SET -->
+    <div style="min-width:360px; max-width:520px; padding:14px; border:1px solid rgba(255,255,255,.12); border-radius:10px;">
+        <h4 style="margin-top:0;">2) Karten für ein Set importieren</h4>
+
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <input @bind="importSetCode"
+                   placeholder="Set-Code (z.B. RP02)"
+                   style="min-width:220px;" />
+
+            <button type="button" @onclick="ImportCardsForSetAsync"
+                    disabled="@isBusyCards"
+                    style="padding:8px 12px; border-radius:8px; border:1px solid rgba(255,255,255,.18);">
+                @(isBusyCards ? "Import läuft…" : "Karten importieren")
+            </button>
+        </div>
+
+        <div style="margin-top:10px; opacity:.9;">
+            @cardsStatus
+        </div>
+
+        <div style="margin-top:10px; font-size:.9rem; opacity:.75;">
+            Nutzt den Set-Code aus deiner DB (z.B. <code>RP02</code>), holt dann den <b>Set-Namen</b> aus <code>CardSets</code> und lädt damit die Karten von YGOPRODeck.
+            <br />
+            Es werden gespeichert: <code>Cards</code> + <code>SetCards</code> inkl. <code>SetNumber</code> (z.B. RP02-DE089) + <code>SortOrder</code>.
+        </div>
+    </div>
+
+</div>
+
+@code
+{
+    // -------------------------
+    // UI State
+    // -------------------------
+    private bool isBusySets = false;
+    private bool isBusyCards = false;
+
+    private string setsStatus = "";
+    private string cardsStatus = "";
+
+    private string importSetCode = "";
+
+    // -------------------------
+    // YGOPRODeck DTOs
+    // -------------------------
+    private sealed class YgoCardSetsResponse
+    {
+        [JsonPropertyName("data")]
+        public List<YgoSetDto>? Data { get; set; }
+    }
+
+    private sealed class YgoSetDto
+    {
+        [JsonPropertyName("set_name")]
+        public string? SetName { get; set; }
+
+        [JsonPropertyName("set_code")]
+        public string? SetCode { get; set; }
+
+        [JsonPropertyName("num_of_cards")]
+        public int NumOfCards { get; set; }
+
+        [JsonPropertyName("tcg_date")]
+        public string? TcgDate { get; set; }
+    }
+
+    private sealed class YgoCardInfoResponse
+    {
+        [JsonPropertyName("data")]
+        public List<YgoCardDto>? Data { get; set; }
+    }
+
+    private sealed class YgoCardDto
+    {
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("card_sets")]
+        public List<YgoCardSetEntryDto>? CardSets { get; set; }
+    }
+
+    private sealed class YgoCardSetEntryDto
+    {
+        [JsonPropertyName("set_name")]
+        public string? SetName { get; set; }
+
+        [JsonPropertyName("set_code")]
+        public string? SetCode { get; set; }
+
+        [JsonPropertyName("set_rarity")]
+        public string? SetRarity { get; set; }
+
+        [JsonPropertyName("set_rarity_code")]
+        public string? SetRarityCode { get; set; }
+    }
+
+    // -------------------------
+    // Step 1: Import all sets
+    // -------------------------
+    private async Task ImportSetsAsync()
+    {
+        if (isBusySets) return;
+        isBusySets = true;
+        setsStatus = "Lade Set-Liste…";
+        StateHasChanged();
+
+        try
+        {
+            // YGOPRODeck sets endpoint
+            // Returns: set_name, set_code, ...
+            var url = "https://db.ygoprodeck.com/api/v7/cardsets.php";
+
+            var setList = await Http.GetFromJsonAsync<List<YgoSetDto>>(url);
+            if (setList is null || setList.Count == 0)
+            {
+                setsStatus = "Keine Sets erhalten (API liefert leer).";
+                return;
+            }
+
+            // Existing codes in DB
+            var existingCodes = await Db.CardSets
+                .Select(s => s.Code)
+                .ToListAsync();
+
+            var existing = new HashSet<string>(existingCodes, StringComparer.OrdinalIgnoreCase);
+
+            int added = 0;
+            int skipped = 0;
+
+            foreach (var s in setList)
+            {
+                var code = (s.SetCode ?? "").Trim();
+                var name = (s.SetName ?? "").Trim();
+
+                if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                if (existing.Contains(code))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                Db.CardSets.Add(new CardSet
+                {
+                    Code = code,
+                    Name = name
+                });
+
+                existing.Add(code);
+                added++;
+            }
+
+            await Db.SaveChangesAsync();
+
+            setsStatus = $"Fertig. Neu: {added} | Bereits vorhanden: {skipped} | Gesamt aus API: {setList.Count}";
+        }
+        catch (Exception ex)
+        {
+            setsStatus = $"Fehler beim Set-Import: {ex.Message}";
+        }
+        finally
+        {
+            isBusySets = false;
+            StateHasChanged();
+        }
+    }
+
+    // -------------------------
+    // Step 2: Import cards for one set
+    // -------------------------
+    private async Task ImportCardsForSetAsync()
+    {
+        if (isBusyCards) return;
+
+        var codeInput = (importSetCode ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(codeInput))
+        {
+            cardsStatus = "Bitte Set-Code eingeben (z.B. RP02).";
+            return;
+        }
+
+        isBusyCards = true;
+        cardsStatus = "Suche Set in DB…";
+        StateHasChanged();
+
+        try
+        {
+            // 1) Find the CardSet by CODE (case-insensitive, EF-friendly)
+            var codeLower = codeInput.ToLower();
+
+            var set = await Db.CardSets
+                .FirstOrDefaultAsync(s => s.Code.ToLower() == codeLower);
+
+            if (set is null)
+            {
+                cardsStatus = $"Set-Code '{codeInput}' nicht in der DB gefunden. Erst Sets importieren.";
+                return;
+            }
+
+            // 2) Use Set NAME for the YGOPRODeck "cardinfo?cardset=" parameter
+            var setName = set.Name;
+
+            cardsStatus = $"Lade Karten für '{set.Code} – {setName}'…";
+            StateHasChanged();
+
+            // Important: cardset parameter expects the set name.
+            var url = $"https://db.ygoprodeck.com/api/v7/cardinfo.php?cardset={Uri.EscapeDataString(setName)}";
+
+            var resp = await Http.GetFromJsonAsync<YgoCardInfoResponse>(url);
+            var cards = resp?.Data ?? new List<YgoCardDto>();
+
+            if (cards.Count == 0)
+            {
+                cardsStatus = $"Keine Karten erhalten für Set '{setName}'. (API ggf. kennt dieses Set nicht unter dem Namen.)";
+                return;
+            }
+
+            // Preload existing cards by name (case-insensitive, in-memory)
+            var existingCards = await Db.Cards
+                .Select(c => new { c.Id, c.Name })
+                .ToListAsync();
+
+            var cardsByName = new Dictionary<string, Card>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in existingCards)
+            {
+                cardsByName[c.Name] = new Card { Id = c.Id, Name = c.Name };
+            }
+
+            // Preload existing set links (avoid duplicates)
+            var existingLinks = await Db.SetCards
+                .Where(sc => sc.CardSetId == set.Id)
+                .Select(sc => sc.SetNumber)
+                .ToListAsync();
+
+            var existingSetNumbers = new HashSet<string>(
+                existingLinks.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()),
+                StringComparer.OrdinalIgnoreCase
+            );
+
+            int createdCards = 0;
+            int createdLinks = 0;
+            int skippedLinks = 0;
+
+            // We'll keep a running sort fallback
+            int fallbackSort = 1;
+
+            foreach (var c in cards)
+            {
+                var cardName = (c.Name ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(cardName))
+                    continue;
+
+                // Ensure Card exists
+                Card cardEntity;
+                if (!cardsByName.TryGetValue(cardName, out cardEntity!))
+                {
+                    cardEntity = new Card { Name = cardName };
+                    Db.Cards.Add(cardEntity);
+                    cardsByName[cardName] = cardEntity;
+                    createdCards++;
+                }
+
+                // Find the exact set entry for THIS set (use code match first, else name match)
+                var entries = c.CardSets ?? new List<YgoCardSetEntryDto>();
+
+                // Prefer match by set_code == set.Code (case-insensitive)
+                var match = entries.FirstOrDefault(e =>
+                    !string.IsNullOrWhiteSpace(e.SetCode) &&
+                    e.SetCode!.Trim().ToLower() == set.Code.ToLower()
+                );
+
+                // Fallback match by set_name == set.Name
+                match ??= entries.FirstOrDefault(e =>
+                    !string.IsNullOrWhiteSpace(e.SetName) &&
+                    e.SetName!.Trim().ToLower() == set.Name.ToLower()
+                );
+
+                // If we cannot find a set entry, we can still link without SetNumber,
+                // but for your app we WANT SetNumber for the ✅/❌ logic.
+                var setNumber = (match?.SetCode ?? "").Trim(); // e.g. RP02-EN090 / RP02-DE089 depending on data
+
+                if (string.IsNullOrWhiteSpace(setNumber))
+                {
+                    // If API doesn't return set_code for this entry, skip linking (otherwise the set view can't work)
+                    continue;
+                }
+
+                if (existingSetNumbers.Contains(setNumber))
+                {
+                    skippedLinks++;
+                    continue;
+                }
+
+                Db.SetCards.Add(new SetCard
+                {
+                    CardSetId = set.Id,
+                    Card = cardEntity,
+                    SetNumber = setNumber,
+                    SortOrder = GuessSortOrder(setNumber, ref fallbackSort)
+                });
+
+                existingSetNumbers.Add(setNumber);
+                createdLinks++;
+            }
+
+            await Db.SaveChangesAsync();
+
+            cardsStatus = $"Fertig: '{set.Code} – {set.Name}'. Neue Karten: {createdCards}, neue Set-Zuordnungen: {createdLinks}, übersprungen (Duplikate): {skippedLinks}.";
+        }
+        catch (Exception ex)
+        {
+            cardsStatus = $"Fehler beim Karten-Import: {ex.Message}";
+        }
+        finally
+        {
+            isBusyCards = false;
+            StateHasChanged();
+        }
+    }
+
+    // -------------------------
+    // Helpers
+    // -------------------------
+    private static int GuessSortOrder(string setNumber, ref int fallbackSort)
+    {
+        // Examples:
+        // RP02-DE089 -> 89
+        // LOB-EN001  -> 1
+        // If not parseable, return incremental fallback.
+
+        if (string.IsNullOrWhiteSpace(setNumber))
+            return fallbackSort++;
+
+        // take trailing digits
+        int i = setNumber.Length - 1;
+        while (i >= 0 && char.IsDigit(setNumber[i])) i--;
+
+        var digits = setNumber[(i + 1)..];
+        if (int.TryParse(digits, out var n) && n > 0)
+            return n;
+
+        return fallbackSort++;
+    }
+}

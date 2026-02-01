@@ -1,0 +1,23 @@
+﻿Set-Content -Path .gitignore -Value @"
+# Build
+bin/
+obj/
+
+# User-specific
+.vscode/
+.idea/
+*.user
+*.suo
+
+# SQLite DBs (wichtig)
+*.db
+*.db-shm
+*.db-wal
+
+# ASP.NET secrets / lokale Settings
+**/appsettings.Development.json
+**/appsettings.Local.json
+
+# Logs
+*.log
+"@

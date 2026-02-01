@@ -1,0 +1,443 @@
+@page "/collection"
+@rendermode InteractiveServer
+@using CardVault.Models
+@using CardVault.Data
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.JSInterop
+@using Microsoft.AspNetCore.Components
+
+@inject CardVault.Data.ApplicationDbContext Db
+@inject UserManager<ApplicationUser> UserManager
+@inject AuthenticationStateProvider AuthStateProvider
+@inject IJSRuntime JS
+
+<h3>Meine Sammlung</h3>
+
+<div style="display:flex; gap:10px; margin:10px 0 16px 0;">
+    <button type="button" @onclick="ShowCollectionView"
+            style="padding:6px 10px; border-radius:6px; border:1px solid #ccc;">
+        Sammlung
+    </button>
+
+    <button type="button" @onclick="ShowSetView"
+            style="padding:6px 10px; border-radius:6px; border:1px solid #ccc;">
+        Set-Ansicht
+    </button>
+</div>
+
+@if (!isLoggedIn)
+{
+    <p>Bitte einloggen, um deine Sammlung zu sehen.</p>
+}
+else if (!isReady)
+{
+    <p>Lade Sammlung...</p>
+}
+else
+{
+    @if (isSetView)
+    {
+        <Sets @ref="setsRef"
+              ActiveCollectionId="@activeCollectionId"
+              UserId="@userId" />
+    }
+    else
+    {
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+            <label style="min-width:90px;">Sammlung:</label>
+
+            <select @bind="activeCollectionId"
+                    @bind:after="OnCollectionChanged"
+                    style="min-width:220px;">
+                @foreach (var c in collections)
+                {
+                    <option value="@c.Id">@c.Name</option>
+                }
+            </select>
+
+            <input placeholder="Neue Sammlung..." @bind="newCollectionName" style="min-width:220px;" />
+            <button type="button" @onclick="CreateCollection">+ Anlegen</button>
+
+            <button type="button" @onclick="DeleteActiveCollection"
+                    style="padding:6px 10px; border-radius:6px; border:1px solid #ccc;">
+                🗑️ Sammlung löschen
+            </button>
+        </div>
+
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:6px;">
+            <input placeholder="Kartenname" @bind="newName" style="min-width:220px;" />
+            <input placeholder="Set (Set-Code (RP02) etc.)" @bind="newSet" @onblur="AutoFillNameFromSetAsync" style="min-width:220px;" />
+            <input placeholder="Rarity (optional)" @bind="newRarity" style="min-width:180px;" />
+
+            <select @bind="newCondition">
+                <option value="NM">NM</option>
+                <option value="EX">EX</option>
+                <option value="GD">GD</option>
+                <option value="PL">PL</option>
+                <option value="PO">PO</option>
+            </select>
+
+            <input type="number" min="1" max="999" @bind="newQty" style="width:70px;" />
+            <button type="button" @onclick="AddItem">Hinzufügen</button>
+        </div>
+
+        @if (!string.IsNullOrWhiteSpace(setLookupHint))
+        {
+            <div style="margin-bottom:10px; font-size:0.95rem; opacity:0.85;">
+                @setLookupHint
+            </div>
+        }
+
+        <input placeholder="Suche..." @bind="search" style="margin-bottom:10px; width:240px;" />
+
+        <table style="width:100%; border-collapse:collapse;">
+            <thead>
+                <tr>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Name</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Set</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Rarity</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Cond</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Qty</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Aktion</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var item in FilteredItems)
+                {
+                    <tr>
+                        <td>@item.CardName</td>
+                        <td>@item.SetCode</td>
+                        <td>@item.Rarity</td>
+                        <td>@item.Condition</td>
+                        <td>@item.Quantity</td>
+                        <td>
+                            <button type="button" @onclick="() => ConfirmDelete(item.Id)">Löschen</button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@code {
+    private bool isLoggedIn;
+    private bool isReady = false;
+    private bool isSetView = false;
+
+    private Sets? setsRef;
+    private bool _needsSetRefresh = false;
+
+    private string userId = "";
+    private List<CardVault.Models.Collection> collections = new();
+    private string newCollectionName = "";
+
+    private List<CollectionItem> items = new();
+    private string search = "";
+
+    private string newName = "";
+    private string newSet = "";
+    private string newRarity = "";
+    private string newCondition = "NM";
+    private int newQty = 1;
+
+    private string? setLookupHint;
+
+    private int activeCollectionId;
+
+    private string StorageKey => $"cardvault.activeCollection.{userId}";
+
+    private IEnumerable<CollectionItem> FilteredItems =>
+        items.Where(i => string.IsNullOrWhiteSpace(search)
+                      || (i.CardName ?? "").Contains(search, StringComparison.OrdinalIgnoreCase));
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await AuthStateProvider.GetAuthenticationStateAsync();
+        var principal = state.User;
+
+        isLoggedIn = principal.Identity?.IsAuthenticated == true;
+        if (!isLoggedIn) return;
+
+        var user = await UserManager.GetUserAsync(principal);
+        if (user is null) return;
+
+        userId = user.Id;
+
+        collections = await Db.Collections
+            .Where(c => c.UserId == userId)
+            .OrderBy(c => c.Id)
+            .ToListAsync();
+
+        if (collections.Count == 0)
+        {
+            var defaultCollection = new CardVault.Models.Collection
+            {
+                UserId = userId,
+                Name = "Main_Default"
+            };
+
+            Db.Collections.Add(defaultCollection);
+            await Db.SaveChangesAsync();
+
+            collections.Add(defaultCollection);
+        }
+
+        await RestoreActiveCollectionFromStorage();
+        await LoadItemsForActiveCollection();
+
+        isReady = true;
+        StateHasChanged();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_needsSetRefresh)
+        {
+            _needsSetRefresh = false;
+            if (setsRef is not null)
+                await setsRef.RefreshOwnedAsync();
+        }
+    }
+
+    private void TriggerSetRefresh()
+    {
+        _needsSetRefresh = true;
+        StateHasChanged();
+    }
+
+    private void ShowCollectionView()
+    {
+        isSetView = false;
+        StateHasChanged();
+    }
+
+    private void ShowSetView()
+    {
+        isSetView = true;
+        TriggerSetRefresh();
+    }
+
+    private async Task RestoreActiveCollectionFromStorage()
+    {
+        activeCollectionId = collections[0].Id;
+
+        try
+        {
+            var saved = await JS.InvokeAsync<string>("localStorage.getItem", StorageKey);
+            if (int.TryParse(saved, out var savedId) && collections.Any(c => c.Id == savedId))
+                activeCollectionId = savedId;
+        }
+        catch { }
+    }
+
+    private async Task OnCollectionChanged()
+    {
+        items = new();
+        StateHasChanged();
+
+        await JS.InvokeVoidAsync("localStorage.setItem", StorageKey, activeCollectionId.ToString());
+        await LoadItemsForActiveCollection();
+
+        TriggerSetRefresh();
+    }
+
+    private async Task CreateCollection()
+    {
+        var name = (newCollectionName ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        if (collections.Any(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        var c = new CardVault.Models.Collection
+        {
+            UserId = userId,
+            Name = name
+        };
+
+        Db.Collections.Add(c);
+        await Db.SaveChangesAsync();
+
+        collections.Add(c);
+
+        activeCollectionId = c.Id;
+        newCollectionName = "";
+
+        await JS.InvokeVoidAsync("localStorage.setItem", StorageKey, activeCollectionId.ToString());
+        await LoadItemsForActiveCollection();
+
+        TriggerSetRefresh();
+    }
+
+    private async Task DeleteActiveCollection()
+    {
+        if (collections.Count <= 1)
+        {
+            await JS.InvokeVoidAsync("alert", "Du kannst die letzte Sammlung nicht löschen.");
+            return;
+        }
+
+        var ok = await JS.InvokeAsync<bool>("confirm", "Wirklich diese Sammlung inkl. aller Karten löschen?");
+        if (!ok) return;
+
+        var col = await Db.Collections
+            .FirstOrDefaultAsync(c => c.Id == activeCollectionId && c.UserId == userId);
+
+        if (col is null) return;
+
+        var colItems = await Db.CollectionItems
+            .Where(x => x.UserId == userId && x.CollectionId == activeCollectionId)
+            .ToListAsync();
+
+        Db.CollectionItems.RemoveRange(colItems);
+        Db.Collections.Remove(col);
+
+        await Db.SaveChangesAsync();
+
+        collections.RemoveAll(x => x.Id == activeCollectionId);
+
+        activeCollectionId = collections[0].Id;
+        await JS.InvokeVoidAsync("localStorage.setItem", StorageKey, activeCollectionId.ToString());
+
+        await LoadItemsForActiveCollection();
+        TriggerSetRefresh();
+    }
+
+    private async Task LoadItemsForActiveCollection()
+    {
+        items = await Db.CollectionItems
+            .Where(x => x.UserId == userId && x.CollectionId == activeCollectionId)
+            .OrderByDescending(x => x.Id)
+            .ToListAsync();
+    }
+
+    // ✅ FIX: kein Equals(StringComparison) in EF-Query -> ToUpper Vergleich (übersetzbar)
+    private async Task AutoFillNameFromSetAsync()
+    {
+        setLookupHint = null;
+
+        var s = (newSet ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(s)) return;
+
+        if (!s.Contains('-', StringComparison.Ordinal)) return;
+
+        var sNorm = s.ToUpper();
+
+        var hit = await Db.SetCards
+            .Include(sc => sc.Card)
+            .Where(sc => sc.SetNumber != null && sc.SetNumber.ToUpper() == sNorm)
+            .Select(sc => sc.Card.Name)
+            .FirstOrDefaultAsync();
+
+        if (!string.IsNullOrWhiteSpace(hit))
+        {
+            newName = hit;
+            setLookupHint = "✅ Kartenname automatisch zugeordnet (noch nicht gespeichert).";
+        }
+        else
+        {
+            setLookupHint = "❌ Keine Karte zu dieser Set-Nr. gefunden.";
+        }
+
+        StateHasChanged();
+    }
+
+    private async Task AddItem()
+    {
+        setLookupHint = null;
+
+        if (string.IsNullOrWhiteSpace(newName))
+        {
+            setLookupHint = "❌ Bitte mindestens einen Kartennamen angeben (oder SetNumber eingeben und ausfüllen lassen).";
+            return;
+        }
+
+        var cardName = newName.Trim();
+        var setInput = (newSet ?? "").Trim();
+
+        var resolvedSetNumberOrCode = await ResolveSetCodeOrSetNumber(setInput, cardName);
+
+        var entity = new CollectionItem
+        {
+            CardName = cardName,
+            SetCode = string.IsNullOrWhiteSpace(resolvedSetNumberOrCode) ? null : resolvedSetNumberOrCode,
+            Rarity = string.IsNullOrWhiteSpace(newRarity) ? null : newRarity.Trim(),
+            Condition = newCondition,
+            Quantity = newQty < 1 ? 1 : newQty,
+            UserId = userId,
+            CollectionId = activeCollectionId
+        };
+
+        Db.CollectionItems.Add(entity);
+        await Db.SaveChangesAsync();
+
+        items.Insert(0, entity);
+
+        newName = "";
+        newSet = "";
+        newRarity = "";
+        newCondition = "NM";
+        newQty = 1;
+
+        TriggerSetRefresh();
+        StateHasChanged();
+    }
+
+    // ✅ FIX: auch hier kein Equals(StringComparison) in EF Query
+    private async Task<string?> ResolveSetCodeOrSetNumber(string setInput, string cardName)
+    {
+        if (string.IsNullOrWhiteSpace(setInput))
+            return null;
+
+        var s = setInput.Trim();
+
+        if (s.Contains('-', StringComparison.Ordinal))
+            return s;
+
+        var setCode = s;
+        var cardNameTrim = (cardName ?? "").Trim();
+
+        var setCodeNorm = setCode.ToUpper();
+        var cardNameNorm = cardNameTrim.ToUpper();
+
+        var hit = await Db.SetCards
+            .Include(sc => sc.Card)
+            .Include(sc => sc.CardSet)
+            .Where(sc => sc.CardSet.Code.ToUpper() == setCodeNorm)
+            .Where(sc => sc.Card != null && sc.Card.Name != null && sc.Card.Name.ToUpper() == cardNameNorm)
+            .Select(sc => sc.SetNumber)
+            .FirstOrDefaultAsync();
+
+        if (!string.IsNullOrWhiteSpace(hit))
+            return hit.Trim();
+
+        return setCode;
+    }
+
+    private async Task ConfirmDelete(int id)
+    {
+        var ok = await JS.InvokeAsync<bool>("confirm", "Wirklich löschen?");
+        if (!ok) return;
+
+        await DeleteItem(id);
+        TriggerSetRefresh();
+        StateHasChanged();
+    }
+
+    private async Task DeleteItem(int id)
+    {
+        var entity = await Db.CollectionItems
+            .FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId && x.CollectionId == activeCollectionId);
+
+        if (entity is null) return;
+
+        Db.CollectionItems.Remove(entity);
+        await Db.SaveChangesAsync();
+
+        items.RemoveAll(x => x.Id == id);
+    }
+}

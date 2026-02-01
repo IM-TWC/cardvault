@@ -1,0 +1,245 @@
+@page "/sets"
+@rendermode InteractiveServer
+@using CardVault.Models
+@using CardVault.Data
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.AspNetCore.Components
+@inject ApplicationDbContext Db
+
+<h3>Sets</h3>
+
+@if (!isReady)
+{
+    <p>Lade Sets…</p>
+}
+else
+{
+    <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+        <label style="min-width:40px;">Set:</label>
+
+        <select @bind="activeSetId"
+                @bind:after="OnSetChanged"
+                style="min-width:420px;">
+            @foreach (var s in sets)
+            {
+                <option value="@s.Id">@($"{s.Code} — {s.Name}")</option>
+            }
+        </select>
+
+        <label style="min-width:70px;">Sprache:</label>
+        <select @bind="activeLang"
+                @bind:after="OnLangChanged"
+                style="min-width:90px;">
+            <option value="EN">EN</option>
+            <option value="DE">DE</option>
+        </select>
+
+        <button type="button" @onclick="RefreshAllAsync" disabled="@isRefreshing"
+                style="padding:6px 10px; border-radius:6px; border:1px solid #ccc;">
+            🔄 @(isRefreshing ? "Lade..." : "Refresh")
+        </button>
+    </div>
+
+    @if (rows.Count == 0)
+    {
+        <p style="opacity:.8;">
+            Keine Karten gefunden für <b>@activeSetDisplay</b> (<b>@activeLang</b>).
+            <br />
+            Falls du gerade erst Sets importiert hast: Es kann sein, dass für dieses Set nur EN oder nur DE vorhanden ist.
+        </p>
+    }
+    else
+    {
+        <table style="width:100%; border-collapse:collapse;">
+            <thead>
+                <tr>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Set-Nr.</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Kartenname</th>
+                    <th style="text-align:left; border-bottom:1px solid #ccc;">Besitz</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var r in rows)
+                {
+                    var key = (r.SetNumber ?? "").Trim();
+                    <tr>
+                        <td>@r.SetNumber</td>
+                        <td>@r.CardName</td>
+                        <td>@(ownedSetNumbers.Contains(key) ? "✅" : "❌")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+@code {
+    [Parameter] public int ActiveCollectionId { get; set; }
+    [Parameter] public string UserId { get; set; } = "";
+
+    private bool isReady = false;
+    private bool isRefreshing = false;
+
+    private string activeLang = "EN";
+
+    // WICHTIG: Enthält SetNumber (z.B. "RP02-DE090"), nicht nur Set-Code ("RP02")
+    private HashSet<string> ownedSetNumbers = new(StringComparer.OrdinalIgnoreCase);
+
+    private List<CardSet> sets = new();
+    private List<Row> rows = new();
+
+    private int activeSetId;
+    private string activeSetCode = "";
+    private string activeSetDisplay = "";
+
+    private int _lastCollectionId;
+    private string _lastUserId = "";
+
+    private sealed class Row
+    {
+        public string? SetNumber { get; set; }
+        public string CardName { get; set; } = "";
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        sets = await Db.CardSets
+            .OrderBy(s => s.Code)
+            .ToListAsync();
+
+        if (sets.Count == 0)
+        {
+            isReady = true;
+            return;
+        }
+
+        activeSetId = sets[0].Id;
+        ApplyActiveSetMeta();
+
+        await LoadOwnedSetNumbers();
+        await LoadRows();
+
+        _lastCollectionId = ActiveCollectionId;
+        _lastUserId = UserId;
+
+        isReady = true;
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        // Wenn Collection oder User gewechselt wurde -> Owned neu laden
+        if (_lastCollectionId != ActiveCollectionId || _lastUserId != UserId)
+        {
+            _lastCollectionId = ActiveCollectionId;
+            _lastUserId = UserId;
+
+            if (isReady)
+            {
+                await LoadOwnedSetNumbers();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+    }
+
+    // Von außen aufrufbar (Collection.razor nutzt @ref)
+    public async Task RefreshOwnedAsync()
+    {
+        await LoadOwnedSetNumbers();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void ApplyActiveSetMeta()
+    {
+        var s = sets.FirstOrDefault(x => x.Id == activeSetId);
+        activeSetCode = s?.Code ?? "";
+        activeSetDisplay = s is null ? "" : $"{s.Code} — {s.Name}";
+    }
+
+    private async Task RefreshAllAsync()
+    {
+        if (isRefreshing) return;
+
+        isRefreshing = true;
+        await InvokeAsync(StateHasChanged);
+        await Task.Yield();
+
+        try
+        {
+            ApplyActiveSetMeta();
+            await LoadOwnedSetNumbers();
+            await LoadRows();
+        }
+        finally
+        {
+            isRefreshing = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task OnSetChanged()
+    {
+        ApplyActiveSetMeta();
+        await LoadRows();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task OnLangChanged()
+    {
+        await LoadRows();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task LoadOwnedSetNumbers()
+    {
+        ownedSetNumbers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(UserId) || ActiveCollectionId <= 0)
+            return;
+
+        var list = await Db.CollectionItems
+            .Where(x => x.UserId == UserId && x.CollectionId == ActiveCollectionId)
+            .Select(x => x.SetCode) // <- hier muss SetNumber drinstehen (z.B. "RP02-DE090")
+            .Where(code => code != null && code.Trim() != "")
+            .ToListAsync();
+
+        foreach (var s in list)
+        {
+            var key = (s ?? "").Trim();
+            if (!string.IsNullOrWhiteSpace(key))
+                ownedSetNumbers.Add(key);
+        }
+    }
+
+    private async Task LoadRows()
+    {
+        rows = new();
+
+        if (activeSetId <= 0)
+            return;
+
+        // Filter nach Sprache über Prefix, z.B. "RP02-EN" oder "RP02-DE"
+        // Falls SetNumber NULL ist, wird sie automatisch ausgeschlossen.
+        var prefix = string.IsNullOrWhiteSpace(activeSetCode)
+            ? null
+            : $"{activeSetCode}-{activeLang}";
+
+        var query = Db.SetCards
+            .Where(sc => sc.CardSetId == activeSetId)
+            .Include(sc => sc.Card)
+            .AsQueryable();
+
+        if (!string.IsNullOrWhiteSpace(prefix))
+        {
+            query = query.Where(sc => sc.SetNumber != null && sc.SetNumber.StartsWith(prefix));
+        }
+
+        rows = await query
+            .OrderBy(sc => sc.SortOrder)
+            .Select(sc => new Row
+            {
+                SetNumber = sc.SetNumber,
+                CardName = sc.Card.Name
+            })
+            .ToListAsync();
+    }
+}
